@@ -1,0 +1,836 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Mapa de Riesgos — Río Loa</title>
+
+    <!-- App instalable -->
+    <meta name="theme-color" content="#2A5C6E">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="Mapa Riesgos">
+    <link rel="manifest" href="manifest.json">
+    <link rel="apple-touch-icon" href="icon-192.png">
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+    <!-- Catálogo de íconos (ICON_DATA + ICON_CATALOG) -->
+    <script src="iconos.js"></script>
+
+    <style>
+        html, body { height: 100%; margin: 0; background-color: #eef2f5; overscroll-behavior: none; }
+        #root { height: 100%; }
+        .lienzo { touch-action: none; cursor: crosshair; background:
+            linear-gradient(45deg,#e9eef2 25%,transparent 25%),
+            linear-gradient(-45deg,#e9eef2 25%,transparent 25%),
+            linear-gradient(45deg,transparent 75%,#e9eef2 75%),
+            linear-gradient(-45deg,transparent 75%,#e9eef2 75%);
+            background-size: 22px 22px; background-position: 0 0, 0 11px, 11px -11px, -11px 0; }
+        .scroll-fina::-webkit-scrollbar { width: 8px; height: 8px; }
+        .scroll-fina::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        @media print { .no-print { display: none !important; } }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/plain" id="app-source">
+        const { useState, useEffect, useRef, useCallback } = React;
+
+        const TEAL = '#2A5C6E';
+        const INTENSIDADES = {
+            verde:    { label: 'Bajo',  color: '#2ecc71' },
+            amarillo: { label: 'Medio', color: '#f1c40f' },
+            rojo:     { label: 'Alto',  color: '#e74c3c' },
+        };
+        const COLORES_FLECHA = [
+            { id: 'rojo',  color: '#e74c3c', label: 'Peligro' },
+            { id: 'verde', color: '#1f9d55', label: 'Evacuación' },
+            { id: 'azul',  color: '#2563eb', label: 'Flujo' },
+            { id: 'negro', color: '#111827', label: 'Neutro' },
+        ];
+        const LS_KEY = 'mapa-riesgos-rioloa-v1';
+        const uid = () => Math.random().toString(36).slice(2, 9);
+
+        // Cache de imágenes de íconos (data URIs -> HTMLImageElement)
+        const imgCache = {};
+        function getIconImg(id, onload) {
+            if (imgCache[id]) return imgCache[id];
+            const im = new Image();
+            im.onload = () => { if (onload) onload(); };
+            im.src = ICON_DATA[id] || '';
+            imgCache[id] = im;
+            return im;
+        }
+        function labelDeIcono(id) {
+            for (const g of ICON_CATALOG) for (const it of g.items) if (it.id === id) return it.label;
+            return id;
+        }
+        // Señalética (obligación, prohibición, salvamento, incendio): borde fijo y SIN nivel de riesgo
+        const EPP_IDS = new Set(), PROHIB_IDS = new Set(), SALV_IDS = new Set(), FIRE_IDS = new Set();
+        ICON_CATALOG.forEach(g => {
+            if (/EPP|Obligaci/i.test(g.grupo))      g.items.forEach(it => EPP_IDS.add(it.id));
+            if (/Prohibic/i.test(g.grupo))          g.items.forEach(it => PROHIB_IDS.add(it.id));
+            if (/Salvamento|Evacuaci/i.test(g.grupo)) g.items.forEach(it => SALV_IDS.add(it.id));
+            if (/incendio/i.test(g.grupo))          g.items.forEach(it => FIRE_IDS.add(it.id));
+        });
+        const esEPP = (id) => EPP_IDS.has(id);
+        const esProhib = (id) => PROHIB_IDS.has(id);
+        const esSalv = (id) => SALV_IDS.has(id);
+        const esFire = (id) => FIRE_IDS.has(id);
+        const esSenal = (id) => esEPP(id) || esProhib(id) || esSalv(id) || esFire(id);
+        const AZUL_EPP = '#1565C0', ROJO_PROHIB = '#c0392b', VERDE_SALV = '#009639', ROJO_FUEGO = '#C8102E';
+        const colorBorde = (id, intensidad) =>
+            esEPP(id) ? AZUL_EPP : esProhib(id) ? ROJO_PROHIB :
+            esSalv(id) ? VERDE_SALV : esFire(id) ? ROJO_FUEGO :
+            INTENSIDADES[intensidad].color;
+
+        const App = () => {
+            // ---- Plano ----
+            const [planSrc, setPlanSrc] = useState(null);      // dataURL
+            const [planName, setPlanName] = useState('');
+            const planImgRef = useRef(null);                   // HTMLImageElement
+
+            // ---- Elementos del mapa (coordenadas en espacio-imagen) ----
+            const [elementos, setElementos] = useState([]);
+            const [selId, setSelId] = useState(null);
+
+            // ---- Herramienta activa ----
+            const [tool, setTool] = useState('select');        // select | icon | flecha | texto | pan
+            const [iconId, setIconId] = useState(ICON_CATALOG[0].items[0].id);
+            const [intensidad, setIntensidad] = useState('rojo');
+            const [tamIcono, setTamIcono] = useState(58);      // px en espacio-imagen
+            const [colorFlecha, setColorFlecha] = useState('rojo');
+            const [mostrarNombres, setMostrarNombres] = useState(true);
+            const [buscar, setBuscar] = useState('');
+            const [grupoAbierto, setGrupoAbierto] = useState(ICON_CATALOG[0].grupo);
+
+            // ---- Encabezado DS 44 ----
+            const [meta, setMeta] = useState({
+                empresa: 'Río Loa S.A.', ct: 'CT Padre Hurtado (CCHPH)', area: '',
+                fecha: new Date().toISOString().slice(0,10), elaboro: 'Braulio Sielpe', reviso: '',
+                codigo: '', rev: '01',
+            });
+            const [showMeta, setShowMeta] = useState(false);
+
+            // ---- Vista (zoom / pan) ----
+            const viewRef = useRef({ zoom: 1, panX: 0, panY: 0 });
+            const canvasRef = useRef(null);
+            const wrapRef = useRef(null);
+
+            // ---- Historial ----
+            const undoRef = useRef([]);
+            const redoRef = useRef([]);
+            const [hist, setHist] = useState({ u: 0, r: 0 });
+            const pushHist = useCallback(() => {
+                undoRef.current.push(JSON.stringify(elementos));
+                if (undoRef.current.length > 60) undoRef.current.shift();
+                redoRef.current = [];
+                setHist({ u: undoRef.current.length, r: 0 });
+            }, [elementos]);
+
+            // ---- Drag state (no-React, vía ref) ----
+            const dragRef = useRef(null);
+
+            // ===================== AUTOGUARDADO =====================
+            useEffect(() => {
+                try {
+                    const raw = localStorage.getItem(LS_KEY);
+                    if (raw) {
+                        const d = JSON.parse(raw);
+                        if (d.planSrc && d.elementos) {
+                            if (confirm('Se encontró un mapa guardado automáticamente. ¿Recuperarlo?')) {
+                                cargarProyecto(d, false);
+                            }
+                        }
+                    }
+                } catch (e) {}
+            }, []);
+
+            useEffect(() => {
+                if (!planSrc) return;
+                const t = setTimeout(() => {
+                    try { localStorage.setItem(LS_KEY, JSON.stringify({ planSrc, planName, elementos, meta })); } catch(e){}
+                }, 600);
+                return () => clearTimeout(t);
+            }, [planSrc, elementos, meta, planName]);
+
+            // ===================== CARGA DE PLANO =====================
+            function onArchivoPlano(e) {
+                const f = e.target.files[0]; if (!f) return;
+                const r = new FileReader();
+                r.onload = ev => {
+                    setPlanSrc(ev.target.result);
+                    setPlanName(f.name);
+                    setElementos([]); setSelId(null);
+                    undoRef.current = []; redoRef.current = []; setHist({u:0,r:0});
+                };
+                r.readAsDataURL(f);
+                e.target.value = '';
+            }
+
+            // Cuando cambia planSrc, cargar la imagen y ajustar a pantalla
+            useEffect(() => {
+                if (!planSrc) { planImgRef.current = null; redraw(); return; }
+                const im = new Image();
+                im.onload = () => { planImgRef.current = im; ajustarPantalla(); };
+                im.src = planSrc;
+            }, [planSrc]);
+
+            // ===================== TRANSFORMACIONES =====================
+            const toImg = (sx, sy) => {
+                const v = viewRef.current;
+                return { x: (sx - v.panX) / v.zoom, y: (sy - v.panY) / v.zoom };
+            };
+
+            function ajustarPantalla() {
+                const im = planImgRef.current, wrap = wrapRef.current;
+                if (!im || !wrap) return;
+                const cw = wrap.clientWidth, ch = wrap.clientHeight;
+                const z = Math.min(cw / im.width, ch / im.height) * 0.96;
+                viewRef.current = { zoom: z, panX: (cw - im.width*z)/2, panY: (ch - im.height*z)/2 };
+                redraw();
+            }
+
+            // ===================== DIBUJO =====================
+            const redraw = useCallback(() => {
+                const cv = canvasRef.current, wrap = wrapRef.current;
+                if (!cv || !wrap) return;
+                const dpr = window.devicePixelRatio || 1;
+                const cw = wrap.clientWidth, ch = wrap.clientHeight;
+                if (cv.width !== cw*dpr || cv.height !== ch*dpr) { cv.width = cw*dpr; cv.height = ch*dpr; }
+                cv.style.width = cw+'px'; cv.style.height = ch+'px';
+                const ctx = cv.getContext('2d');
+                ctx.setTransform(dpr,0,0,dpr,0,0);
+                ctx.clearRect(0,0,cw,ch);
+                const v = viewRef.current;
+                ctx.save();
+                ctx.translate(v.panX, v.panY); ctx.scale(v.zoom, v.zoom);
+                const im = planImgRef.current;
+                if (im) ctx.drawImage(im, 0, 0);
+                dibujarElementos(ctx, elementos, selId);
+                ctx.restore();
+            }, [elementos, selId, mostrarNombres]);
+
+            useEffect(() => { redraw(); }, [redraw]);
+            useEffect(() => {
+                const on = () => redraw();
+                window.addEventListener('resize', on);
+                return () => window.removeEventListener('resize', on);
+            }, [redraw]);
+
+            function dibujarElementos(ctx, els, sel) {
+                els.forEach(el => {
+                    if (el.type === 'flecha') dibujarFlecha(ctx, el, el.id === sel);
+                    else if (el.type === 'texto') dibujarTexto(ctx, el, el.id === sel);
+                    else if (el.type === 'icono') dibujarIcono(ctx, el, el.id === sel);
+                });
+            }
+
+            function dibujarIcono(ctx, el, selected) {
+                const s = el.size, r = s/2;
+                const col = colorBorde(el.iconId, el.intensidad);
+                const x = el.x, y = el.y;
+
+                ctx.save();
+                // recortar al círculo (evita que las esquinas del pictograma salgan)
+                ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.clip();
+                // base blanca para legibilidad
+                ctx.fillStyle = 'white'; ctx.fillRect(x-r, y-r, s, s);
+                // pictograma más grande
+                const im = getIconImg(el.iconId, redraw);
+                if (im && im.complete && im.naturalWidth) {
+                    const iw = s*0.80;
+                    const ar = im.naturalWidth / im.naturalHeight;
+                    let dw = iw, dh = iw;
+                    if (ar > 1) dh = iw/ar; else dw = iw*ar;
+                    ctx.drawImage(im, x - dw/2, y - dh/2, dw, dh);
+                }
+                // tinte difuminado del color del riesgo (degradado radial, suave al centro)
+                const grad = ctx.createRadialGradient(x, y, r*0.1, x, y, r);
+                grad.addColorStop(0,    hexToRgba(col, 0.04));
+                grad.addColorStop(0.6,  hexToRgba(col, 0.14));
+                grad.addColorStop(1,    hexToRgba(col, 0.42));
+                ctx.fillStyle = grad; ctx.fillRect(x-r, y-r, s, s);
+                ctx.restore();
+
+                // borde entrecortado del color del riesgo
+                ctx.save();
+                ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2);
+                ctx.setLineDash([Math.max(4, s*0.16), Math.max(3, s*0.11)]);
+                ctx.lineWidth = Math.max(2.5, s*0.06);
+                ctx.strokeStyle = col;
+                ctx.stroke();
+                ctx.restore();
+
+                if (mostrarNombres) dibujarNombre(ctx, labelDeIcono(el.iconId), x, y + r + 4, s);
+                if (selected) marcarSeleccion(ctx, x-r, y-r, s, s);
+            }
+
+            // Nombre del riesgo bajo el ícono, centrado, con halo blanco y ajuste de línea
+            function dibujarNombre(ctx, texto, cx, topY, s) {
+                const fs = Math.max(11, s*0.23);
+                const maxW = Math.max(72, s*2.6);
+                ctx.save();
+                ctx.font = '700 '+fs+'px Arial';
+                ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+                ctx.lineJoin = 'round'; ctx.miterLimit = 2;
+                const palabras = texto.split(' ');
+                const lineas = []; let cur = '';
+                palabras.forEach(p => {
+                    const t = cur ? cur+' '+p : p;
+                    if (ctx.measureText(t).width > maxW && cur) { lineas.push(cur); cur = p; }
+                    else cur = t;
+                });
+                if (cur) lineas.push(cur);
+                let yy = topY + fs*0.3;
+                lineas.forEach(ln => {
+                    ctx.lineWidth = Math.max(3, fs*0.34); ctx.strokeStyle = 'white';
+                    ctx.strokeText(ln, cx, yy);
+                    ctx.fillStyle = '#111827';
+                    ctx.fillText(ln, cx, yy);
+                    yy += fs*1.12;
+                });
+                ctx.restore();
+            }
+
+            function dibujarFlecha(ctx, el, selected) {
+                const c = COLORES_FLECHA.find(f=>f.id===el.color)?.color || '#e74c3c';
+                const w = el.width || 6;
+                const dx = el.x2-el.x1, dy = el.y2-el.y1;
+                const ang = Math.atan2(dy,dx), len = Math.hypot(dx,dy);
+                const head = Math.max(14, w*3);
+                ctx.save(); ctx.lineCap='round'; ctx.lineJoin='round';
+                ctx.strokeStyle = c; ctx.fillStyle = c; ctx.lineWidth = w;
+                ctx.beginPath(); ctx.moveTo(el.x1,el.y1);
+                ctx.lineTo(el.x2 - Math.cos(ang)*head*0.8, el.y2 - Math.sin(ang)*head*0.8); ctx.stroke();
+                ctx.beginPath();
+                ctx.moveTo(el.x2, el.y2);
+                ctx.lineTo(el.x2 - Math.cos(ang-0.45)*head, el.y2 - Math.sin(ang-0.45)*head);
+                ctx.lineTo(el.x2 - Math.cos(ang+0.45)*head, el.y2 - Math.sin(ang+0.45)*head);
+                ctx.closePath(); ctx.fill();
+                ctx.restore();
+                if (selected) {
+                    const minx=Math.min(el.x1,el.x2), miny=Math.min(el.y1,el.y2);
+                    marcarSeleccion(ctx, minx, miny, Math.abs(dx), Math.abs(dy));
+                }
+            }
+
+            function dibujarTexto(ctx, el, selected) {
+                const fs = el.fontSize || 22;
+                ctx.save();
+                ctx.font = '700 '+fs+'px Arial';
+                ctx.textBaseline = 'top';
+                ctx.lineJoin = 'round'; ctx.miterLimit = 2;
+                ctx.lineWidth = Math.max(3, fs*0.22); ctx.strokeStyle = 'white';
+                ctx.strokeText(el.text, el.x, el.y);
+                ctx.fillStyle = el.color || '#111827';
+                ctx.fillText(el.text, el.x, el.y);
+                if (selected) {
+                    const m = ctx.measureText(el.text);
+                    marcarSeleccion(ctx, el.x-4, el.y-4, m.width+8, fs+8);
+                }
+                ctx.restore();
+            }
+
+            function roundRect(ctx,x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
+            function marcarSeleccion(ctx,x,y,w,h){const v=viewRef.current;ctx.save();ctx.setLineDash([6/v.zoom,4/v.zoom]);ctx.lineWidth=2/v.zoom;ctx.strokeStyle='#2563eb';ctx.strokeRect(x-6,y-6,w+12,h+12);ctx.restore();}
+
+            // ===================== HIT TEST =====================
+            function hitTest(ix, iy) {
+                for (let i = elementos.length-1; i >= 0; i--) {
+                    const el = elementos[i];
+                    if (el.type === 'icono') {
+                        if (Math.hypot(ix-el.x, iy-el.y) <= el.size/2) return el;
+                    } else if (el.type === 'texto') {
+                        const fs = el.fontSize||22; const w = (el.text.length)*fs*0.55;
+                        if (ix>=el.x-4 && ix<=el.x+w && iy>=el.y-4 && iy<=el.y+fs+4) return el;
+                    } else if (el.type === 'flecha') {
+                        if (distSeg(ix,iy,el.x1,el.y1,el.x2,el.y2) < Math.max(10, (el.width||6))) return el;
+                    }
+                }
+                return null;
+            }
+            function distSeg(px,py,x1,y1,x2,y2){const A=px-x1,B=py-y1,C=x2-x1,D=y2-y1;const dot=A*C+B*D,len=C*C+D*D;let t=len?dot/len:-1;t=Math.max(0,Math.min(1,t));const xx=x1+t*C,yy=y1+t*D;return Math.hypot(px-xx,py-yy);}
+
+            // ===================== PUNTEROS =====================
+            function pos(e) {
+                const rect = canvasRef.current.getBoundingClientRect();
+                return { sx: e.clientX-rect.left, sy: e.clientY-rect.top };
+            }
+            function onDown(e) {
+                if (!planImgRef.current) return;
+                canvasRef.current.setPointerCapture(e.pointerId);
+                const {sx,sy} = pos(e); const p = toImg(sx,sy);
+                if (tool === 'pan') { dragRef.current = {modo:'pan', sx, sy, ...viewRef.current}; return; }
+                if (tool === 'icono') {
+                    pushHist();
+                    const nuevo = { id:uid(), type:'icono', iconId, intensidad, x:p.x, y:p.y, size:tamIcono };
+                    setElementos(a=>[...a, nuevo]); setSelId(nuevo.id);
+                    return;
+                }
+                if (tool === 'texto') {
+                    const txt = prompt('Texto / etiqueta:'); if (!txt) return;
+                    pushHist();
+                    const nuevo = { id:uid(), type:'texto', x:p.x, y:p.y, text:txt, color:'#111827', fontSize:Math.round(tamIcono*0.42) };
+                    setElementos(a=>[...a, nuevo]); setSelId(nuevo.id);
+                    return;
+                }
+                if (tool === 'flecha') {
+                    pushHist();
+                    const nuevo = { id:uid(), type:'flecha', x1:p.x, y1:p.y, x2:p.x, y2:p.y, color:colorFlecha, width:Math.max(5, tamIcono*0.12) };
+                    setElementos(a=>[...a, nuevo]); setSelId(nuevo.id);
+                    dragRef.current = {modo:'flecha', id:nuevo.id};
+                    return;
+                }
+                // tool === 'select'
+                const hit = hitTest(p.x, p.y);
+                if (hit) {
+                    setSelId(hit.id);
+                    pushHist();
+                    dragRef.current = {modo:'mover', id:hit.id, type:hit.type, ox:p.x, oy:p.y, snap:JSON.stringify(hit)};
+                } else { setSelId(null); }
+            }
+            function onMove(e) {
+                const d = dragRef.current; if (!d) return;
+                const {sx,sy} = pos(e); const p = toImg(sx,sy);
+                if (d.modo === 'pan') {
+                    viewRef.current = {...viewRef.current, panX: d.panX+(sx-d.sx), panY: d.panY+(sy-d.sy)};
+                    redraw(); return;
+                }
+                if (d.modo === 'flecha') {
+                    setElementos(a=>a.map(el=> el.id===d.id ? {...el, x2:p.x, y2:p.y} : el));
+                    return;
+                }
+                if (d.modo === 'mover') {
+                    const base = JSON.parse(d.snap);
+                    const ddx = p.x-d.ox, ddy = p.y-d.oy;
+                    setElementos(a=>a.map(el=>{
+                        if (el.id!==d.id) return el;
+                        if (el.type==='flecha') return {...el, x1:base.x1+ddx, y1:base.y1+ddy, x2:base.x2+ddx, y2:base.y2+ddy};
+                        return {...el, x:base.x+ddx, y:base.y+ddy};
+                    }));
+                }
+            }
+            function onUp(e) {
+                const d = dragRef.current; dragRef.current = null;
+                if (d && d.modo==='flecha') {
+                    // descartar flechas de largo casi nulo
+                    setElementos(a=>a.filter(el=> !(el.id===d.id && Math.hypot(el.x2-el.x1,el.y2-el.y1)<6)));
+                }
+            }
+            function onWheel(e) {
+                if (!planImgRef.current) return;
+                e.preventDefault();
+                const {sx,sy} = pos(e);
+                const v = viewRef.current;
+                const factor = e.deltaY < 0 ? 1.12 : 1/1.12;
+                const nz = Math.max(0.05, Math.min(8, v.zoom*factor));
+                viewRef.current = { zoom:nz, panX: sx-(sx-v.panX)*(nz/v.zoom), panY: sy-(sy-v.panY)*(nz/v.zoom) };
+                redraw();
+            }
+
+            // ===================== ACCIONES =====================
+            // Agregar ícono al instante en el centro de la vista y dejarlo listo para arrastrar
+            function agregarIconoCentro(id) {
+                if (!planImgRef.current) { setTool('icono'); return; } // sin plano: vuelve a modo clic
+                const wrap = wrapRef.current;
+                const off = (elementos.length % 6) * (tamIcono * 0.28);
+                const p = toImg(wrap.clientWidth/2 + off, wrap.clientHeight/2 + off);
+                pushHist();
+                const nuevo = { id:uid(), type:'icono', iconId:id, intensidad, x:p.x, y:p.y, size:tamIcono };
+                setElementos(a=>[...a, nuevo]);
+                setSelId(nuevo.id);
+                setTool('select');   // mantener presionado sobre el ícono lo mueve
+            }
+
+            function eliminarSel() {
+                if (!selId) return;
+                pushHist();
+                setElementos(a=>a.filter(el=>el.id!==selId)); setSelId(null);
+            }
+            function undo() {
+                if (!undoRef.current.length) return;
+                redoRef.current.push(JSON.stringify(elementos));
+                const prev = undoRef.current.pop();
+                setElementos(JSON.parse(prev)); setSelId(null);
+                setHist({u:undoRef.current.length, r:redoRef.current.length});
+            }
+            function redo() {
+                if (!redoRef.current.length) return;
+                undoRef.current.push(JSON.stringify(elementos));
+                const nx = redoRef.current.pop();
+                setElementos(JSON.parse(nx)); setSelId(null);
+                setHist({u:undoRef.current.length, r:redoRef.current.length});
+            }
+            function cambiarTamSel(nuevo) {
+                setElementos(a=>a.map(el=>{
+                    if (el.id!==selId) return el;
+                    if (el.type==='icono') return {...el, size:nuevo};
+                    if (el.type==='texto') return {...el, fontSize:Math.round(nuevo*0.42)};
+                    if (el.type==='flecha') return {...el, width:Math.max(5,nuevo*0.12)};
+                    return el;
+                }));
+            }
+            function limpiarTodo() {
+                if (!elementos.length) return;
+                if (confirm('¿Borrar todos los elementos del mapa? (el plano se mantiene)')) { pushHist(); setElementos([]); setSelId(null); }
+            }
+
+            const seleccionado = elementos.find(el=>el.id===selId);
+
+            // ===================== LEYENDA =====================
+            function leyendaItems() {
+                const map = {};
+                elementos.filter(e=>e.type==='icono').forEach(e=>{
+                    const senal = esSenal(e.iconId);
+                    const k = senal ? e.iconId : e.iconId+'|'+e.intensidad;
+                    if (!map[k]) map[k] = { iconId:e.iconId, intensidad:e.intensidad, senal, n:0 };
+                    map[k].n++;
+                });
+                return Object.values(map).sort((a,b)=> labelDeIcono(a.iconId).localeCompare(labelDeIcono(b.iconId)));
+            }
+
+            // ===================== EXPORTAR =====================
+            // Render full-res del plano + elementos en espacio-imagen
+            function renderComposite() {
+                const im = planImgRef.current; if (!im) return null;
+                const cv = document.createElement('canvas');
+                cv.width = im.width; cv.height = im.height;
+                const ctx = cv.getContext('2d');
+                ctx.drawImage(im,0,0);
+                // dibujar sin selección
+                elementos.forEach(el=>{
+                    if (el.type==='flecha') dibujarFlecha(ctx, el, false);
+                    else if (el.type==='texto') dibujarTexto(ctx, el, false);
+                    else if (el.type==='icono') dibujarIcono(ctx, el, false);
+                });
+                return cv;
+            }
+
+            function descargar(nombre, dataUrl) {
+                const a = document.createElement('a'); a.href = dataUrl; a.download = nombre; a.click();
+            }
+
+            function exportarPNG() {
+                const cv = renderComposite();
+                if (!cv) { alert('Carga un plano primero.'); return; }
+                descargar('Mapa_Riesgos_'+(meta.area||'CCHPH').replace(/\s+/g,'_')+'.png', cv.toDataURL('image/png'));
+            }
+
+            async function exportarPDF() {
+                const cv = renderComposite();
+                if (!cv) { alert('Carga un plano primero.'); return; }
+                const { jsPDF } = window.jspdf;
+                const doc = new jsPDF({ orientation:'landscape', unit:'mm', format:'a4' });
+                const pw = doc.internal.pageSize.getWidth(), ph = doc.internal.pageSize.getHeight();
+                const M = 8;
+                // Encabezado
+                doc.setFillColor(42,92,110); doc.rect(0,0,pw,16,'F');
+                doc.setTextColor(255); doc.setFont('helvetica','bold'); doc.setFontSize(13);
+                doc.text('MAPA DE RIESGOS', M, 10.5);
+                doc.setFontSize(8); doc.setFont('helvetica','normal');
+                doc.text(meta.empresa+'  |  '+meta.ct, pw-M, 7, {align:'right'});
+                doc.text((meta.area? 'Área: '+meta.area+'   ':'')+'Fecha: '+meta.fecha, pw-M, 12, {align:'right'});
+
+                // Mapa
+                const leg = leyendaItems();
+                const legW = leg.length ? 62 : 0;
+                const areaX = M, areaY = 20, areaW = pw - M*2 - legW - (legW?4:0), areaH = ph - areaY - 14;
+                const ar = cv.width/cv.height;
+                let dw = areaW, dh = areaW/ar;
+                if (dh > areaH) { dh = areaH; dw = areaH*ar; }
+                const ix = areaX + (areaW-dw)/2, iy = areaY + (areaH-dh)/2;
+                doc.setDrawColor(200); doc.rect(areaX, areaY, areaW, areaH);
+                doc.addImage(cv.toDataURL('image/jpeg',0.9), 'JPEG', ix, iy, dw, dh);
+
+                // Leyenda
+                if (leg.length) {
+                    const lx = pw - M - legW;
+                    doc.setFillColor(245,247,249); doc.rect(lx, areaY, legW, areaH, 'F');
+                    doc.setDrawColor(210); doc.rect(lx, areaY, legW, areaH);
+                    doc.setTextColor(42,92,110); doc.setFont('helvetica','bold'); doc.setFontSize(9);
+                    doc.text('SIMBOLOGÍA', lx+3, areaY+6);
+                    let yy = areaY + 12; const isz = 7;
+                    doc.setFontSize(6.6);
+                    for (const it of leg) {
+                        if (yy > areaY+areaH-8) break;
+                        const col = colorBorde(it.iconId, it.intensidad);
+                        const rgb = hex2rgb(col);
+                        doc.setFillColor(rgb[0],rgb[1],rgb[2]);
+                        doc.roundedRect(lx+3, yy-isz+1.5, isz, isz, 1, 1, 'F');
+                        const im = imgCache[it.iconId];
+                        if (im && im.complete) { try { doc.addImage(ICON_DATA[it.iconId],'JPEG', lx+3.8, yy-isz+2.3, isz-1.6, isz-1.6);}catch(e){} }
+                        doc.setTextColor(40); doc.setFont('helvetica','normal');
+                        const txt = doc.splitTextToSize(labelDeIcono(it.iconId)+(it.senal?'':' ('+INTENSIDADES[it.intensidad].label+')'), legW-14);
+                        doc.text(txt, lx+3+isz+2, yy-isz+5);
+                        yy += Math.max(isz+2.5, txt.length*3 + 2.5);
+                    }
+                }
+                // Pie
+                doc.setTextColor(120); doc.setFontSize(7); doc.setFont('helvetica','normal');
+                const pie = [meta.codigo && ('Cód: '+meta.codigo+(meta.rev?' Rev '+meta.rev:'')),
+                             meta.elaboro && ('Elaboró: '+meta.elaboro), meta.reviso && ('Revisó: '+meta.reviso)]
+                             .filter(Boolean).join('     ');
+                doc.text(pie, M, ph-5);
+                doc.text('Generado con la app Mapa de Riesgos — Río Loa', pw-M, ph-5, {align:'right'});
+
+                doc.save('Mapa_Riesgos_'+(meta.area||'CCHPH').replace(/\s+/g,'_')+'.pdf');
+            }
+            function hex2rgb(h){const n=parseInt(h.slice(1),16);return [(n>>16)&255,(n>>8)&255,n&255];}
+            function hexToRgba(h,a){const [r,g,b]=hex2rgb(h);return 'rgba('+r+','+g+','+b+','+a+')';}
+
+            // ===================== PROYECTO (JSON) =====================
+            function guardarProyecto() {
+                const data = { version:1, planSrc, planName, elementos, meta };
+                const blob = new Blob([JSON.stringify(data)], {type:'application/json'});
+                descargar('Proyecto_Mapa_'+(meta.area||'CCHPH').replace(/\s+/g,'_')+'.json', URL.createObjectURL(blob));
+            }
+            function onArchivoProyecto(e) {
+                const f = e.target.files[0]; if (!f) return;
+                const r = new FileReader();
+                r.onload = ev => { try { cargarProyecto(JSON.parse(ev.target.result), true); } catch(err){ alert('Archivo de proyecto inválido.'); } };
+                r.readAsText(f); e.target.value='';
+            }
+            function cargarProyecto(d, reset) {
+                setMeta(m=>({...m, ...(d.meta||{})}));
+                setPlanName(d.planName||'');
+                setElementos(d.elementos||[]);
+                setPlanSrc(d.planSrc||null);
+                setSelId(null);
+                if (reset) { undoRef.current=[]; redoRef.current=[]; setHist({u:0,r:0}); }
+            }
+
+            // ===================== ATAJOS =====================
+            useEffect(() => {
+                const h = (e) => {
+                    if (e.target.tagName==='INPUT' || e.target.tagName==='TEXTAREA') return;
+                    if ((e.metaKey||e.ctrlKey) && e.key==='z' && !e.shiftKey) { e.preventDefault(); undo(); }
+                    else if ((e.metaKey||e.ctrlKey) && (e.key==='y' || (e.key==='z'&&e.shiftKey))) { e.preventDefault(); redo(); }
+                    else if (e.key==='Delete' || e.key==='Backspace') { eliminarSel(); }
+                    else if (e.key==='v') setTool('select');
+                    else if (e.key==='f') setTool('flecha');
+                    else if (e.key==='t') setTool('texto');
+                    else if (e.key==='i') setTool('icono');
+                };
+                window.addEventListener('keydown', h);
+                return () => window.removeEventListener('keydown', h);
+            });
+
+            // ===================== UI =====================
+            const iconosFiltrados = (items) => buscar
+                ? items.filter(it=> it.label.toLowerCase().includes(buscar.toLowerCase()))
+                : items;
+
+            const Btn = ({active, onClick, children, title, color}) => (
+                <button title={title} onClick={onClick}
+                    className={"px-3 py-2 rounded-lg text-xs font-bold transition border " +
+                        (active ? "text-white border-transparent shadow" : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50")}
+                    style={active ? {background: color||TEAL} : {}}>{children}</button>
+            );
+
+            return (
+                <div className="h-full flex flex-col">
+                    {/* BARRA SUPERIOR */}
+                    <header className="no-print flex items-center gap-2 px-3 py-2 bg-white border-b border-slate-200 shadow-sm flex-wrap">
+                        <div className="flex items-center gap-2 mr-2">
+                            <div className="w-8 h-8 rounded-lg flex items-center justify-center text-white font-black" style={{background:TEAL}}>R</div>
+                            <div className="leading-tight">
+                                <div className="font-black text-slate-700 text-sm">Mapa de Riesgos</div>
+                                <div className="text-[10px] text-slate-400">Río Loa · CT Padre Hurtado</div>
+                            </div>
+                        </div>
+                        <label className="px-3 py-2 rounded-lg text-xs font-bold text-white cursor-pointer shadow" style={{background:TEAL}}>
+                            Cargar plano
+                            <input type="file" accept="image/*" className="hidden" onChange={onArchivoPlano}/>
+                        </label>
+                        <div className="w-px h-7 bg-slate-200 mx-1"></div>
+                        <Btn active={tool==='select'} onClick={()=>setTool('select')} title="Seleccionar / mover (V)">✛ Mover</Btn>
+                        <Btn active={tool==='icono'} onClick={()=>setTool('icono')} title="Colocar ícono (I)">◉ Ícono</Btn>
+                        <Btn active={tool==='flecha'} onClick={()=>setTool('flecha')} title="Flecha (F)">➜ Flecha</Btn>
+                        <Btn active={tool==='texto'} onClick={()=>setTool('texto')} title="Texto (T)">T Texto</Btn>
+                        <Btn active={tool==='pan'} onClick={()=>setTool('pan')} title="Mover vista">✋ Vista</Btn>
+                        <div className="w-px h-7 bg-slate-200 mx-1"></div>
+                        <Btn onClick={undo} title="Deshacer (Ctrl/Cmd+Z)">↶</Btn>
+                        <Btn onClick={redo} title="Rehacer">↷</Btn>
+                        <Btn onClick={()=>{const v=viewRef.current;v.zoom*=1.2;redraw();}} title="Acercar">＋</Btn>
+                        <Btn onClick={()=>{const v=viewRef.current;v.zoom/=1.2;redraw();}} title="Alejar">－</Btn>
+                        <Btn onClick={ajustarPantalla} title="Ajustar a pantalla">⤢ Ajustar</Btn>
+                        <Btn active={mostrarNombres} onClick={()=>setMostrarNombres(v=>!v)} title="Mostrar / ocultar los nombres de los riesgos">
+                            {mostrarNombres ? '🏷️ Nombres' : '🚫 Nombres'}
+                        </Btn>
+
+                        <div className="ml-auto flex items-center gap-2">
+                            <Btn onClick={()=>setShowMeta(true)} title="Datos del mapa">📋 Datos</Btn>
+                            <label className="px-3 py-2 rounded-lg text-xs font-bold bg-white text-slate-600 border border-slate-200 hover:bg-slate-50 cursor-pointer">
+                                Abrir proyecto
+                                <input type="file" accept="application/json,.json" className="hidden" onChange={onArchivoProyecto}/>
+                            </label>
+                            <Btn onClick={guardarProyecto} title="Guardar proyecto editable (.json)">💾 Proyecto</Btn>
+                            <Btn onClick={exportarPNG} color="#1f9d55" active title="Exportar imagen PNG">⬇ PNG</Btn>
+                            <Btn onClick={exportarPDF} color="#b91c1c" active title="Exportar PDF DS 44">⬇ PDF</Btn>
+                        </div>
+                    </header>
+
+                    <div className="flex-1 flex min-h-0">
+                        {/* PANEL IZQUIERDO */}
+                        <aside className="no-print w-72 bg-white border-r border-slate-200 flex flex-col">
+                            {/* Intensidad */}
+                            <div className="p-3 border-b border-slate-100">
+                                <div className="text-[11px] font-black uppercase text-slate-400 mb-2">Nivel de riesgo</div>
+                                <div className="grid grid-cols-3 gap-1.5">
+                                    {Object.entries(INTENSIDADES).map(([k,v])=>(
+                                        <button key={k} onClick={()=>setIntensidad(k)}
+                                            className={"py-2 rounded-lg text-xs font-bold border-2 transition "+(intensidad===k?'text-white':'text-slate-600 bg-white')}
+                                            style={intensidad===k?{background:v.color,borderColor:v.color}:{borderColor:v.color}}>
+                                            {v.label}
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+
+                            {/* Tamaño */}
+                            <div className="p-3 border-b border-slate-100">
+                                <div className="flex items-center justify-between text-[11px] font-black uppercase text-slate-400 mb-1">
+                                    <span>{seleccionado?'Tamaño (sel.)':'Tamaño ícono'}</span>
+                                    <span className="text-slate-500">{seleccionado? (seleccionado.size||Math.round((seleccionado.fontSize||0)/0.42)||Math.round((seleccionado.width||0)/0.12)) : tamIcono}px</span>
+                                </div>
+                                <input type="range" min="24" max="140" value={tamIcono}
+                                    onChange={e=>{const n=+e.target.value; setTamIcono(n); if(seleccionado) cambiarTamSel(n);}}
+                                    className="w-full"/>
+                                {seleccionado && (
+                                    <button onClick={eliminarSel} className="mt-2 w-full py-1.5 rounded-lg text-xs font-bold text-white bg-red-500 hover:bg-red-600">Eliminar seleccionado</button>
+                                )}
+                            </div>
+
+                            {/* Color flecha (cuando flecha activa) */}
+                            {tool==='flecha' && (
+                                <div className="p-3 border-b border-slate-100">
+                                    <div className="text-[11px] font-black uppercase text-slate-400 mb-2">Tipo de flecha</div>
+                                    <div className="grid grid-cols-2 gap-1.5">
+                                        {COLORES_FLECHA.map(c=>(
+                                            <button key={c.id} onClick={()=>setColorFlecha(c.id)}
+                                                className={"py-1.5 rounded-lg text-[11px] font-bold border-2 flex items-center gap-1.5 px-2 "+(colorFlecha===c.id?'':'bg-white')}
+                                                style={colorFlecha===c.id?{background:c.color,color:'#fff',borderColor:c.color}:{borderColor:c.color,color:c.color}}>
+                                                <span>➜</span>{c.label}
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Catálogo de íconos */}
+                            <div className="p-3 pb-1">
+                                <div className="text-[11px] font-black uppercase text-slate-400 mb-2">Tipo de riesgo</div>
+                                <input value={buscar} onChange={e=>setBuscar(e.target.value)} placeholder="Buscar riesgo…"
+                                    className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm mb-1 focus:outline-none focus:border-teal-500"/>
+                                <div className="text-[10px] text-slate-400 px-1">Toca un ícono y se agrega al centro. Mantén presionado sobre él para moverlo.</div>
+                            </div>
+                            <div className="flex-1 overflow-y-auto scroll-fina px-3 pb-3">
+                                {ICON_CATALOG.map(g=>{
+                                    const items = iconosFiltrados(g.items);
+                                    if (!items.length) return null;
+                                    const abierto = buscar ? true : grupoAbierto===g.grupo;
+                                    return (
+                                        <div key={g.grupo} className="mb-1">
+                                            <button onClick={()=>setGrupoAbierto(abierto?'':g.grupo)}
+                                                className="w-full text-left text-[11px] font-bold text-slate-600 py-1.5 px-2 rounded hover:bg-slate-50 flex justify-between">
+                                                <span>{g.grupo}</span><span className="text-slate-300">{abierto?'▾':'▸'}</span>
+                                            </button>
+                                            {abierto && (
+                                                <div className="flex flex-col gap-1 p-1">
+                                                    {items.map(it=>(
+                                                        <button key={it.id} title={it.label}
+                                                            onClick={()=>{ setIconId(it.id); agregarIconoCentro(it.id); }}
+                                                            className={"flex items-center gap-2 rounded-lg border-2 p-1.5 bg-white text-left transition "+(iconId===it.id?'border-teal-500 ring-2 ring-teal-200':'hover:border-slate-300')}
+                                                            style={iconId===it.id?{}:{borderColor:'#e2e8f0'}}>
+                                                            <img src={ICON_DATA[it.id]} alt={it.label} className="w-9 h-9 object-contain shrink-0"/>
+                                                            <span className="text-[11px] text-slate-600 leading-tight">{it.label}</span>
+                                                        </button>
+                                                    ))}
+                                                </div>
+                                            )}
+                                        </div>
+                                    );
+                                })}
+                            </div>
+
+                            <div className="p-2 border-t border-slate-100 flex gap-2">
+                                <button onClick={limpiarTodo} className="flex-1 py-1.5 rounded-lg text-[11px] font-bold text-red-500 border border-red-200 hover:bg-red-50">Borrar todo</button>
+                            </div>
+                        </aside>
+
+                        {/* LIENZO */}
+                        <main ref={wrapRef} className="flex-1 relative overflow-hidden bg-slate-100">
+                            <canvas ref={canvasRef} className="lienzo absolute inset-0"
+                                onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp} onWheel={onWheel}/>
+                            {!planSrc && (
+                                <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-400 pointer-events-none">
+                                    <div className="text-5xl mb-3">🗺️</div>
+                                    <div className="font-bold text-slate-500">Carga un plano para empezar</div>
+                                    <div className="text-sm mt-1">Botón “Cargar plano” arriba a la izquierda</div>
+                                </div>
+                            )}
+                            {/* Mini-leyenda flotante */}
+                            {planSrc && leyendaItems().length>0 && (
+                                <div className="no-print absolute bottom-3 left-3 bg-white/95 backdrop-blur rounded-xl shadow-lg border border-slate-200 p-2 max-w-[260px] max-h-[40%] overflow-y-auto scroll-fina">
+                                    <div className="text-[10px] font-black uppercase text-slate-400 mb-1 px-1">Simbología ({leyendaItems().length})</div>
+                                    {leyendaItems().map((it,i)=>(
+                                        <div key={i} className="flex items-center gap-2 px-1 py-0.5">
+                                            <div className="w-6 h-6 rounded bg-white border-2 flex items-center justify-center shrink-0" style={{borderColor: colorBorde(it.iconId, it.intensidad)}}>
+                                                <img src={ICON_DATA[it.iconId]} className="max-w-full max-h-full object-contain"/>
+                                            </div>
+                                            <span className="text-[11px] text-slate-600 leading-tight">{labelDeIcono(it.iconId)}{!it.senal && <span className="text-slate-400"> · {INTENSIDADES[it.intensidad].label}</span>}</span>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </main>
+                    </div>
+
+                    {/* MODAL DATOS */}
+                    {showMeta && (
+                        <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50" onClick={()=>setShowMeta(false)}>
+                            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-5" onClick={e=>e.stopPropagation()}>
+                                <h2 className="font-black text-slate-700 mb-3 uppercase text-sm">Datos del mapa (encabezado DS 44)</h2>
+                                <div className="grid grid-cols-2 gap-3">
+                                    {[['empresa','Empresa'],['ct','Centro de trabajo'],['area','Área / recinto'],['fecha','Fecha'],['elaboro','Elaboró'],['reviso','Revisó'],['codigo','Código documento'],['rev','Revisión']].map(([k,lbl])=>(
+                                        <label key={k} className="text-xs font-bold text-slate-500">
+                                            {lbl}
+                                            <input type={k==='fecha'?'date':'text'} value={meta[k]||''}
+                                                onChange={e=>setMeta(m=>({...m,[k]:e.target.value}))}
+                                                className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm font-normal text-slate-700 focus:outline-none focus:border-teal-500"/>
+                                        </label>
+                                    ))}
+                                </div>
+                                <button onClick={()=>setShowMeta(false)} className="mt-4 w-full py-2.5 rounded-lg text-sm font-bold text-white" style={{background:TEAL}}>Listo</button>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+
+    <!-- Bootstrap: compila el JSX con runtime clásico -->
+    <script>
+        (function () {
+            try {
+                var src = document.getElementById('app-source').textContent;
+                var out = Babel.transform(src, { presets: [['react', { runtime: 'classic' }]] }).code;
+                (0, eval)(out);
+            } catch (e) {
+                console.error(e);
+                document.getElementById('root').innerHTML = '<div style="padding:24px;font-family:sans-serif;color:#b91c1c">Error al iniciar la app: ' + (e && e.message) + '</div>';
+            }
+        })();
+    </script>
+</body>
+</html>
