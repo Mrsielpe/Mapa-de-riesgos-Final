@@ -136,6 +136,8 @@
 
             // ---- Drag state (no-React, vía ref) ----
             const dragRef = useRef(null);
+            const pointersRef = useRef(new Map());   // multitáctil
+            const pinchRef = useRef(null);            // pellizco (zoom dos dedos)
 
             // ===================== AUTOGUARDADO =====================
             useEffect(() => {
@@ -365,8 +367,21 @@
             }
             function onDown(e) {
                 if (!planImgRef.current) return;
-                canvasRef.current.setPointerCapture(e.pointerId);
-                const {sx,sy} = pos(e); const p = toImg(sx,sy);
+                const {sx,sy} = pos(e);
+                pointersRef.current.set(e.pointerId, {x:sx, y:sy});
+                try { canvasRef.current.setPointerCapture(e.pointerId); } catch(_) {}
+                // dos dedos -> pellizco (zoom + paneo), cancela cualquier arrastre
+                if (pointersRef.current.size === 2) {
+                    dragRef.current = null;
+                    const pts = [...pointersRef.current.values()];
+                    pinchRef.current = {
+                        dist: Math.hypot(pts[0].x-pts[1].x, pts[0].y-pts[1].y) || 1,
+                        cx: (pts[0].x+pts[1].x)/2, cy: (pts[0].y+pts[1].y)/2,
+                    };
+                    return;
+                }
+                if (pointersRef.current.size > 2) return;
+                const p = toImg(sx,sy);
                 if (tool === 'pan') { dragRef.current = {modo:'pan', sx, sy, ...viewRef.current}; return; }
                 if (tool === 'icono') {
                     pushHist();
@@ -397,6 +412,24 @@
                 } else { setSelId(null); }
             }
             function onMove(e) {
+                if (pointersRef.current.has(e.pointerId)) {
+                    const q = pos(e); pointersRef.current.set(e.pointerId, {x:q.sx, y:q.sy});
+                }
+                // pellizco con dos dedos: zoom + paneo del mapa completo
+                if (pointersRef.current.size >= 2 && pinchRef.current) {
+                    const pts = [...pointersRef.current.values()];
+                    const dist = Math.hypot(pts[0].x-pts[1].x, pts[0].y-pts[1].y) || 1;
+                    const cx = (pts[0].x+pts[1].x)/2, cy = (pts[0].y+pts[1].y)/2;
+                    const v = viewRef.current, pz = pinchRef.current;
+                    let panX = v.panX + (cx - pz.cx), panY = v.panY + (cy - pz.cy);   // paneo
+                    const nz = Math.max(0.05, Math.min(8, v.zoom * (dist / pz.dist))); // zoom
+                    panX = cx - (cx - panX) * (nz / v.zoom);
+                    panY = cy - (cy - panY) * (nz / v.zoom);
+                    viewRef.current = { zoom: nz, panX, panY };
+                    pinchRef.current = { dist, cx, cy };
+                    redraw();
+                    return;
+                }
                 const d = dragRef.current; if (!d) return;
                 const {sx,sy} = pos(e); const p = toImg(sx,sy);
                 if (d.modo === 'pan') {
@@ -418,6 +451,8 @@
                 }
             }
             function onUp(e) {
+                pointersRef.current.delete(e.pointerId);
+                if (pointersRef.current.size < 2) pinchRef.current = null;
                 const d = dragRef.current; dragRef.current = null;
                 if (d && d.modo==='flecha') {
                     // descartar flechas de largo casi nulo
@@ -654,7 +689,7 @@
                         <Btn active={tool==='icono'} onClick={()=>setTool('icono')} title="Colocar ícono (I)">◉ Ícono</Btn>
                         <Btn active={tool==='flecha'} onClick={()=>setTool('flecha')} title="Flecha (F)">➜ Flecha</Btn>
                         <Btn active={tool==='texto'} onClick={()=>setTool('texto')} title="Texto (T)">T Texto</Btn>
-                        <Btn active={tool==='pan'} onClick={()=>setTool('pan')} title="Mover vista">✋ Vista</Btn>
+                        <Btn active={tool==='pan'} onClick={()=>setTool('pan')} title="Mover todo el mapa (plano + íconos). En táctil: arrastra con un dedo; pellizca con dos para zoom">✋ Mover mapa</Btn>
                         <div className="w-px h-7 bg-slate-200 mx-1"></div>
                         <Btn onClick={undo} title="Deshacer (Ctrl/Cmd+Z)">↶</Btn>
                         <Btn onClick={redo} title="Rehacer">↷</Btn>
