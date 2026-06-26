@@ -735,7 +735,7 @@
                                     <span>{seleccionado?'Tamaño (sel.)':'Tamaño ícono'}</span>
                                     <span className="text-slate-500">{seleccionado? (seleccionado.size||Math.round((seleccionado.fontSize||0)/0.42)||Math.round((seleccionado.width||0)/0.12)) : tamIcono}px</span>
                                 </div>
-                                <input type="range" min="24" max="140" value={tamIcono}
+                                <input type="range" min="24" max="280" value={tamIcono}
                                     onChange={e=>{const n=+e.target.value; setTamIcono(n); if(seleccionado) cambiarTamSel(n);}}
                                     className="w-full"/>
                                 {seleccionado && (
